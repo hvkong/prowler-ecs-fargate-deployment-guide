@@ -1,0 +1,1283 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Prowler ECS Fargate (Demo/POC). Deploys full stack: Postgres, Valkey, Neo4j,
+  API, Worker, Worker-Beat, MCP, UI with ALB, EFS, Service Connect.
+  Requires: custom UI ECR image, ACM cert, domain, RSA key pair.
+  All secrets stored in AWS Secrets Manager and injected via ECS Secrets at runtime.
+  Not for production — use RDS, ElastiCache, multi-AZ, and hardened SGs in prod.
+
+# =============================================================================
+# METADATA - Console parameter grouping and labels
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - DomainName
+          - ACMCertificateArn
+          - AllowedCIDR
+      - Label:
+          default: "Container Images"
+        Parameters:
+          - UIImageUri
+          - APIImageTag
+          - MCPImageTag
+      - Label:
+          default: "Database Credentials"
+        Parameters:
+          - PostgresPassword
+          - Neo4jPassword
+      - Label:
+          default: "Application Security Keys"
+        Parameters:
+          - DjangoSecretsEncryptionKey
+          - AuthSecret
+      - Label:
+          default: "Application Settings"
+        Parameters:
+          - DjangoAccessTokenLifetime
+          - EnvironmentPrefix
+
+    ParameterLabels:
+      VpcId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs (minimum 2, public subnets)"
+      DomainName:
+        default: "Domain Name (e.g., prowler.example.com)"
+      ACMCertificateArn:
+        default: "ACM Certificate ARN"
+      AllowedCIDR:
+        default: "Allowed CIDR for ALB access"
+      UIImageUri:
+        default: "Custom UI ECR Image URI"
+      APIImageTag:
+        default: "Prowler API Docker Hub tag"
+      MCPImageTag:
+        default: "Prowler MCP Docker Hub tag"
+      PostgresPassword:
+        default: "PostgreSQL Password"
+      Neo4jPassword:
+        default: "Neo4j Password"
+      DjangoSecretsEncryptionKey:
+        default: "Django Secrets Encryption Key"
+      AuthSecret:
+        default: "Auth.js Session Secret"
+
+      DjangoAccessTokenLifetime:
+        default: "Access Token Lifetime (minutes)"
+      EnvironmentPrefix:
+        default: "Resource Name Prefix"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+
+  # --- Network Configuration ---
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      Select the VPC to deploy into. Must have internet access (public subnets with IGW).
+      The default VPC works well for demos.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Select at least 2 public subnets in different AZs (required by ALB).
+      These subnets must have auto-assign public IP enabled for Fargate tasks
+      to pull images from Docker Hub and ECR.
+
+  DomainName:
+    Type: String
+    Description: >
+      The domain name for accessing Prowler (e.g., prowler.example.com).
+      You must point this domain's DNS to the ALB after deployment.
+      Used for AUTH_URL, CORS configuration, and SAML callbacks.
+    AllowedPattern: '^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$'
+    ConstraintDescription: Must be a valid domain name.
+
+  ACMCertificateArn:
+    Type: String
+    Description: >
+      ARN of an ACM certificate validated for the domain above.
+      Example: arn:aws:acm:us-east-1:123456789012:certificate/abc-123
+      The certificate must be in the same region as this stack.
+    AllowedPattern: '^arn:aws:acm:[a-z0-9-]+:\d{12}:certificate\/[a-f0-9-]+$'
+    ConstraintDescription: Must be a valid ACM certificate ARN.
+
+  AllowedCIDR:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: >
+      CIDR range allowed to access the ALB (HTTPS).
+      For security, restrict to your IP (e.g., 203.0.113.1/32).
+      Use 0.0.0.0/0 only if you want public access.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  # --- Container Images ---
+  UIImageUri:
+    Type: String
+    Description: >
+      Full ECR URI for the custom Prowler UI image (built with internal API URL baked in).
+      Format: <account-id>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>
+      See deployment guide for build instructions.
+    AllowedPattern: '^[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com\/.+:.+$'
+    ConstraintDescription: Must be a valid ECR image URI with tag.
+
+  APIImageTag:
+    Type: String
+    Default: 'stable'
+    Description: >
+      Docker Hub tag for prowlercloud/prowler-api image.
+      Use 'stable' for the latest release or a specific version tag.
+
+  MCPImageTag:
+    Type: String
+    Default: 'stable'
+    Description: >
+      Docker Hub tag for prowlercloud/prowler-mcp image.
+      Use 'stable' for the latest release.
+
+  # --- Database Credentials ---
+  PostgresPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: >
+      Password for the PostgreSQL database.
+      Will be stored in AWS Secrets Manager by this template.
+
+  Neo4jPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: >
+      Password for the Neo4j graph database (used for Attack Paths).
+      Will be stored in AWS Secrets Manager by this template.
+
+  # --- Application Security Keys ---
+  DjangoSecretsEncryptionKey:
+    Type: String
+    NoEcho: true
+    Description: >
+      Encryption key for Django secrets storage.
+      Generate with: openssl rand -base64 32
+      Will be stored in AWS Secrets Manager by this template.
+
+  AuthSecret:
+    Type: String
+    NoEcho: true
+    Description: >
+      Secret for Auth.js session encryption in the UI.
+      Generate with: openssl rand -base64 32
+      Will be stored in AWS Secrets Manager by this template.
+
+
+
+  # --- Application Settings ---
+  DjangoAccessTokenLifetime:
+    Type: Number
+    Default: 180
+    MinValue: 30
+    MaxValue: 1440
+    Description: >
+      JWT access token lifetime in minutes. Set to 180 (3 hours) for demos
+      to avoid token expiry during long scan pipelines. Default 30 is too short
+      for Fargate deployments where scans + integrations can take 60+ minutes.
+
+  EnvironmentPrefix:
+    Type: String
+    Default: 'prowler'
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9-]*$'
+    Description: >
+      Prefix for all resource names (e.g., prowler, mycompany-prowler).
+      Lowercase letters, numbers, and hyphens only. Starts with a letter.
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Security Groups
+  # ---------------------------------------------------------------------------
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${EnvironmentPrefix} - ALB inbound HTTPS'
+      GroupName: !Sub '${EnvironmentPrefix}-alb-sg'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedCIDR
+          Description: HTTPS from allowed CIDR
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedCIDR
+          Description: HTTP redirect to HTTPS
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${EnvironmentPrefix} - App containers'
+      GroupName: !Sub '${EnvironmentPrefix}-app-sg'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: API from ALB
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: UI from ALB
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: MCP from ALB
+
+  AppSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref AppSecurityGroup
+      Description: All TCP from self (inter-container)
+
+  DataSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${EnvironmentPrefix} - Data stores'
+      GroupName: !Sub '${EnvironmentPrefix}-data-sg'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: Postgres from app
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: Valkey from app
+        - IpProtocol: tcp
+          FromPort: 7687
+          ToPort: 7687
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: Neo4j Bolt from app
+        - IpProtocol: tcp
+          FromPort: 7474
+          ToPort: 7474
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: Neo4j HTTP from app
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${EnvironmentPrefix} - EFS mount targets'
+      GroupName: !Sub '${EnvironmentPrefix}-efs-sg'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref DataSecurityGroup
+          Description: NFS from data containers
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: NFS from app containers (shared output volume)
+
+  # ---------------------------------------------------------------------------
+  # EFS File System and Access Points
+  # ---------------------------------------------------------------------------
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${EnvironmentPrefix}-data'
+
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroups: [!Ref EFSSecurityGroup]
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [1, !Ref SubnetIds]
+      SecurityGroups: [!Ref EFSSecurityGroup]
+
+  PostgresAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      PosixUser:
+        Uid: '70'
+        Gid: '70'
+      RootDirectory:
+        Path: /postgres-data
+        CreationInfo:
+          OwnerUid: '70'
+          OwnerGid: '70'
+          Permissions: '0755'
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub '${EnvironmentPrefix}-postgres'
+
+  Neo4jAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      PosixUser:
+        Uid: '7474'
+        Gid: '7474'
+      RootDirectory:
+        Path: /neo4j-data
+        CreationInfo:
+          OwnerUid: '7474'
+          OwnerGid: '7474'
+          Permissions: '0755'
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub '${EnvironmentPrefix}-neo4j'
+
+  OutputAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      PosixUser:
+        Uid: '1000'
+        Gid: '1000'
+      RootDirectory:
+        Path: /prowler-output
+        CreationInfo:
+          OwnerUid: '1000'
+          OwnerGid: '1000'
+          Permissions: '0755'
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub '${EnvironmentPrefix}-output'
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group
+  # ---------------------------------------------------------------------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${EnvironmentPrefix}'
+      RetentionInDays: 7
+
+  # ---------------------------------------------------------------------------
+  # IAM Roles
+  # ---------------------------------------------------------------------------
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentPrefix}-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref JWTSigningKeySecret
+                  - !Ref JWTVerifyingKeySecret
+                  - !Ref DjangoSecretsKeySecret
+                  - !Ref PostgresPasswordSecret
+                  - !Ref Neo4jPasswordSecret
+                  - !Ref Neo4jAuthSecret
+                  - !Ref AuthSecretSecret
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentPrefix}-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ECSExecPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: '*'
+
+  # ---------------------------------------------------------------------------
+  # Secrets Manager
+  # ---------------------------------------------------------------------------
+  JWTSigningKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentPrefix}/jwt-signing-key'
+      Description: >-
+        RSA private key for JWT signing. MUST be populated with actual PEM content
+        after stack creation. Use: aws secretsmanager put-secret-value
+        --secret-id <prefix>/jwt-signing-key --secret-string file://private.pem
+      SecretString: 'REPLACE_ME_WITH_RSA_PRIVATE_KEY'
+
+  JWTVerifyingKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentPrefix}/jwt-verifying-key'
+      Description: >-
+        RSA public key for JWT verification. MUST be populated with actual PEM content
+        after stack creation. Use: aws secretsmanager put-secret-value
+        --secret-id <prefix>/jwt-verifying-key --secret-string file://public.pem
+      SecretString: 'REPLACE_ME_WITH_RSA_PUBLIC_KEY'
+
+  DjangoSecretsKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentPrefix}/django-secrets-key'
+      Description: Django secrets encryption key
+      SecretString: !Ref DjangoSecretsEncryptionKey
+
+  PostgresPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentPrefix}/postgres-password'
+      Description: PostgreSQL database password
+      SecretString: !Ref PostgresPassword
+
+  Neo4jPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentPrefix}/neo4j-password'
+      Description: Neo4j database password
+      SecretString: !Ref Neo4jPassword
+
+  Neo4jAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentPrefix}/neo4j-auth'
+      Description: Neo4j auth string (neo4j/<password>)
+      SecretString: !Sub 'neo4j/${Neo4jPassword}'
+
+  AuthSecretSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentPrefix}/auth-secret'
+      Description: Auth.js session encryption secret
+      SecretString: !Ref AuthSecret
+
+  # ---------------------------------------------------------------------------
+  # ECS Cluster with Cloud Map Namespace
+  # ---------------------------------------------------------------------------
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${EnvironmentPrefix}'
+      ServiceConnectDefaults:
+        Namespace: !GetAtt CloudMapNamespace.Arn
+
+  CloudMapNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: prowler
+      Vpc: !Ref VpcId
+      Description: Prowler service discovery namespace
+
+
+  # ---------------------------------------------------------------------------
+  # Application Load Balancer
+  # ---------------------------------------------------------------------------
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${EnvironmentPrefix}-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref ALBSecurityGroup]
+
+  APITargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentPrefix}-api-tg'
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /api/v1/docs
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  UITargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentPrefix}-ui-tg'
+      Port: 3000
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200,302,307'
+
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref ACMCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref UITargetGroup
+
+  HTTPRedirectListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: '443'
+            StatusCode: HTTP_301
+
+  APIListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HTTPSListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          Values: ['/api/v1/*']
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref APITargetGroup
+
+  # ---------------------------------------------------------------------------
+  # Cloud Map Services (for data layer - no Service Connect proxy)
+  # ---------------------------------------------------------------------------
+  PostgresDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: postgres
+      NamespaceId: !GetAtt CloudMapNamespace.Id
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 10
+
+  ValkeyDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: valkey
+      NamespaceId: !GetAtt CloudMapNamespace.Id
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 10
+
+  Neo4jDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: neo4j
+      NamespaceId: !GetAtt CloudMapNamespace.Id
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 10
+
+  # ---------------------------------------------------------------------------
+  # Task Definitions
+  # ---------------------------------------------------------------------------
+  PostgresTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentPrefix}-postgres'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: postgres-data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EFSFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref PostgresAccessPoint
+              IAM: DISABLED
+      ContainerDefinitions:
+        - Name: postgres
+          Image: 'postgres:16.3-alpine3.20'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 5432
+              Protocol: tcp
+              Name: postgres
+          MountPoints:
+            - SourceVolume: postgres-data
+              ContainerPath: /var/lib/postgresql/data
+          Environment:
+            - Name: POSTGRES_USER
+              Value: prowler_admin
+            - Name: POSTGRES_DB
+              Value: prowler_db
+          Secrets:
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Ref PostgresPasswordSecret
+          HealthCheck:
+            Command: ['CMD-SHELL', 'pg_isready -U prowler_admin -d prowler_db']
+            Interval: 10
+            Timeout: 5
+            Retries: 5
+            StartPeriod: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: postgres
+
+  ValkeyTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentPrefix}-valkey'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: valkey
+          Image: 'valkey/valkey:7-alpine3.19'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 6379
+              Protocol: tcp
+              Name: valkey
+          HealthCheck:
+            Command: ['CMD-SHELL', 'valkey-cli ping']
+            Interval: 10
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: valkey
+
+  Neo4jTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentPrefix}-neo4j'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '1024'
+      Memory: '3072'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: neo4j-data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EFSFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref Neo4jAccessPoint
+              IAM: DISABLED
+      ContainerDefinitions:
+        - Name: neo4j
+          Image: 'graphstack/dozerdb:5.26.3.0'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 7687
+              Protocol: tcp
+              Name: neo4j-bolt
+            - ContainerPort: 7474
+              Protocol: tcp
+              Name: neo4j-http
+              AppProtocol: http
+          MountPoints:
+            - SourceVolume: neo4j-data
+              ContainerPath: /data
+          Environment:
+            - Name: NEO4J_dbms_max__databases
+              Value: '1000'
+            - Name: NEO4J_server_memory_pagecache_size
+              Value: '512M'
+            - Name: NEO4J_server_memory_heap_initial__size
+              Value: '512M'
+            - Name: NEO4J_server_memory_heap_max__size
+              Value: '512M'
+            - Name: NEO4J_PLUGINS
+              Value: '["apoc"]'
+            - Name: NEO4J_dbms_security_procedures_allowlist
+              Value: 'apoc.*'
+            - Name: dbms.connector.bolt.listen_address
+              Value: '0.0.0.0:7687'
+          Secrets:
+            - Name: NEO4J_AUTH
+              ValueFrom: !Ref Neo4jAuthSecret
+          HealthCheck:
+            Command: ['CMD-SHELL', 'wget --no-verbose -O /dev/null http://localhost:7474 || exit 1']
+            Interval: 15
+            Timeout: 10
+            Retries: 10
+            StartPeriod: 120
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: neo4j
+
+  APITaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentPrefix}-api'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '1024'
+      Memory: '4096'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: prowler-output
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EFSFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref OutputAccessPoint
+              IAM: DISABLED
+      ContainerDefinitions:
+        - Name: api
+          Image: !Sub 'prowlercloud/prowler-api:${APIImageTag}'
+          Essential: true
+          EntryPoint: ['/home/prowler/docker-entrypoint.sh', 'prod']
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+              Name: api
+              AppProtocol: http
+          MountPoints:
+            - SourceVolume: prowler-output
+              ContainerPath: /tmp/prowler_api_output
+          Environment:
+            - { Name: DJANGO_SETTINGS_MODULE, Value: config.django.production }
+            - { Name: DJANGO_ALLOWED_HOSTS, Value: '*' }
+            - { Name: DJANGO_BIND_ADDRESS, Value: '0.0.0.0' }
+            - { Name: DJANGO_PORT, Value: '8080' }
+            - { Name: DJANGO_DEBUG, Value: 'False' }
+            - { Name: DJANGO_LOGGING_FORMATTER, Value: human_readable }
+            - { Name: DJANGO_LOGGING_LEVEL, Value: INFO }
+            - { Name: DJANGO_WORKERS, Value: '2' }
+            - { Name: DJANGO_MANAGE_DB_PARTITIONS, Value: 'True' }
+            - { Name: DJANGO_ACCESS_TOKEN_LIFETIME, Value: !Sub '${DjangoAccessTokenLifetime}' }
+            - { Name: DJANGO_REFRESH_TOKEN_LIFETIME, Value: '1440' }
+            - { Name: DJANGO_CACHE_MAX_AGE, Value: '3600' }
+            - { Name: DJANGO_STALE_WHILE_REVALIDATE, Value: '60' }
+            - { Name: DJANGO_BROKER_VISIBILITY_TIMEOUT, Value: '86400' }
+            - { Name: DJANGO_THROTTLE_TOKEN_OBTAIN, Value: '50/minute' }
+            - { Name: DJANGO_CORS_ALLOWED_ORIGINS, Value: !Sub 'https://${DomainName}' }
+            - { Name: POSTGRES_HOST, Value: postgres.prowler }
+            - { Name: POSTGRES_PORT, Value: '5432' }
+            - { Name: POSTGRES_ADMIN_USER, Value: prowler_admin }
+            - { Name: POSTGRES_USER, Value: prowler_admin }
+            - { Name: POSTGRES_DB, Value: prowler_db }
+            - { Name: VALKEY_HOST, Value: valkey.prowler }
+            - { Name: VALKEY_PORT, Value: '6379' }
+            - { Name: VALKEY_DB, Value: '0' }
+            - { Name: NEO4J_HOST, Value: neo4j.prowler }
+            - { Name: NEO4J_PORT, Value: '7687' }
+            - { Name: NEO4J_USER, Value: neo4j }
+          Secrets:
+            - Name: DJANGO_SECRETS_ENCRYPTION_KEY
+              ValueFrom: !Ref DjangoSecretsKeySecret
+            - Name: DJANGO_TOKEN_SIGNING_KEY
+              ValueFrom: !Ref JWTSigningKeySecret
+            - Name: DJANGO_TOKEN_VERIFYING_KEY
+              ValueFrom: !Ref JWTVerifyingKeySecret
+            - Name: POSTGRES_ADMIN_PASSWORD
+              ValueFrom: !Ref PostgresPasswordSecret
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Ref PostgresPasswordSecret
+            - Name: NEO4J_PASSWORD
+              ValueFrom: !Ref Neo4jPasswordSecret
+          HealthCheck:
+            Command: ['CMD-SHELL', 'wget --no-verbose --spider http://localhost:8080/api/v1/docs || exit 1']
+            Interval: 15
+            Timeout: 5
+            Retries: 5
+            StartPeriod: 120
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  WorkerTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentPrefix}-worker'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '2048'
+      Memory: '4096'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: prowler-output
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EFSFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref OutputAccessPoint
+              IAM: DISABLED
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub 'prowlercloud/prowler-api:${APIImageTag}'
+          Essential: true
+          EntryPoint: ['/home/prowler/docker-entrypoint.sh', 'worker']
+          MountPoints:
+            - SourceVolume: prowler-output
+              ContainerPath: /tmp/prowler_api_output
+          Ulimits:
+            - Name: nofile
+              SoftLimit: 65536
+              HardLimit: 65536
+          Environment:
+            - { Name: DJANGO_SETTINGS_MODULE, Value: config.django.production }
+            - { Name: DJANGO_ALLOWED_HOSTS, Value: '*' }
+            - { Name: DJANGO_BIND_ADDRESS, Value: '0.0.0.0' }
+            - { Name: DJANGO_PORT, Value: '8080' }
+            - { Name: DJANGO_DEBUG, Value: 'False' }
+            - { Name: DJANGO_LOGGING_FORMATTER, Value: human_readable }
+            - { Name: DJANGO_LOGGING_LEVEL, Value: INFO }
+            - { Name: DJANGO_WORKERS, Value: '2' }
+            - { Name: DJANGO_MANAGE_DB_PARTITIONS, Value: 'True' }
+            - { Name: DJANGO_ACCESS_TOKEN_LIFETIME, Value: !Sub '${DjangoAccessTokenLifetime}' }
+            - { Name: DJANGO_REFRESH_TOKEN_LIFETIME, Value: '1440' }
+            - { Name: DJANGO_BROKER_VISIBILITY_TIMEOUT, Value: '86400' }
+            - { Name: DJANGO_CORS_ALLOWED_ORIGINS, Value: !Sub 'https://${DomainName}' }
+            - { Name: POSTGRES_HOST, Value: postgres.prowler }
+            - { Name: POSTGRES_PORT, Value: '5432' }
+            - { Name: POSTGRES_ADMIN_USER, Value: prowler_admin }
+            - { Name: POSTGRES_DB, Value: prowler_db }
+            - { Name: VALKEY_HOST, Value: valkey.prowler }
+            - { Name: VALKEY_PORT, Value: '6379' }
+            - { Name: VALKEY_DB, Value: '0' }
+            - { Name: NEO4J_HOST, Value: neo4j.prowler }
+            - { Name: NEO4J_PORT, Value: '7687' }
+            - { Name: NEO4J_USER, Value: neo4j }
+          Secrets:
+            - Name: DJANGO_SECRETS_ENCRYPTION_KEY
+              ValueFrom: !Ref DjangoSecretsKeySecret
+            - Name: DJANGO_TOKEN_SIGNING_KEY
+              ValueFrom: !Ref JWTSigningKeySecret
+            - Name: DJANGO_TOKEN_VERIFYING_KEY
+              ValueFrom: !Ref JWTVerifyingKeySecret
+            - Name: POSTGRES_ADMIN_PASSWORD
+              ValueFrom: !Ref PostgresPasswordSecret
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Ref PostgresPasswordSecret
+            - Name: NEO4J_PASSWORD
+              ValueFrom: !Ref Neo4jPasswordSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+
+  WorkerBeatTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentPrefix}-worker-beat'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker-beat
+          Image: !Sub 'prowlercloud/prowler-api:${APIImageTag}'
+          Essential: true
+          EntryPoint: ['../docker-entrypoint.sh', 'beat']
+          Ulimits:
+            - Name: nofile
+              SoftLimit: 65536
+              HardLimit: 65536
+          Environment:
+            - { Name: DJANGO_SETTINGS_MODULE, Value: config.django.production }
+            - { Name: DJANGO_ALLOWED_HOSTS, Value: '*' }
+            - { Name: DJANGO_BIND_ADDRESS, Value: '0.0.0.0' }
+            - { Name: DJANGO_PORT, Value: '8080' }
+            - { Name: DJANGO_DEBUG, Value: 'False' }
+            - { Name: DJANGO_LOGGING_FORMATTER, Value: human_readable }
+            - { Name: DJANGO_LOGGING_LEVEL, Value: INFO }
+            - { Name: DJANGO_ACCESS_TOKEN_LIFETIME, Value: !Sub '${DjangoAccessTokenLifetime}' }
+            - { Name: DJANGO_REFRESH_TOKEN_LIFETIME, Value: '1440' }
+            - { Name: DJANGO_BROKER_VISIBILITY_TIMEOUT, Value: '86400' }
+            - { Name: POSTGRES_HOST, Value: postgres.prowler }
+            - { Name: POSTGRES_PORT, Value: '5432' }
+            - { Name: POSTGRES_ADMIN_USER, Value: prowler_admin }
+            - { Name: POSTGRES_DB, Value: prowler_db }
+            - { Name: VALKEY_HOST, Value: valkey.prowler }
+            - { Name: VALKEY_PORT, Value: '6379' }
+            - { Name: VALKEY_DB, Value: '0' }
+            - { Name: NEO4J_HOST, Value: neo4j.prowler }
+            - { Name: NEO4J_PORT, Value: '7687' }
+            - { Name: NEO4J_USER, Value: neo4j }
+          Secrets:
+            - Name: DJANGO_SECRETS_ENCRYPTION_KEY
+              ValueFrom: !Ref DjangoSecretsKeySecret
+            - Name: DJANGO_TOKEN_SIGNING_KEY
+              ValueFrom: !Ref JWTSigningKeySecret
+            - Name: DJANGO_TOKEN_VERIFYING_KEY
+              ValueFrom: !Ref JWTVerifyingKeySecret
+            - Name: POSTGRES_ADMIN_PASSWORD
+              ValueFrom: !Ref PostgresPasswordSecret
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Ref PostgresPasswordSecret
+            - Name: NEO4J_PASSWORD
+              ValueFrom: !Ref Neo4jPasswordSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker-beat
+
+  MCPTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentPrefix}-mcp'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: mcp-server
+          Image: !Sub 'prowlercloud/prowler-mcp:${MCPImageTag}'
+          Essential: true
+          Command: ['uvicorn', '--host', '0.0.0.0', '--port', '8000']
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+              Name: mcp
+              AppProtocol: http
+          Environment:
+            - { Name: PROWLER_MCP_TRANSPORT_MODE, Value: http }
+            - { Name: API_BASE_URL, Value: 'http://prowler-api.prowler:8080/api/v1' }
+          HealthCheck:
+            Command: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:8000/health || exit 1']
+            Interval: 10
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 15
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: mcp
+
+  UITaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentPrefix}-ui'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: ui
+          Image: !Ref UIImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+              Name: ui
+              AppProtocol: http
+          Environment:
+            - { Name: NEXT_PUBLIC_API_BASE_URL, Value: 'http://prowler-api.prowler:8080/api/v1' }
+            - { Name: API_BASE_URL, Value: 'http://prowler-api.prowler:8080/api/v1' }
+            - { Name: AUTH_URL, Value: !Sub 'https://${DomainName}' }
+            - { Name: AUTH_TRUST_HOST, Value: 'true' }
+            - { Name: NEXT_PUBLIC_API_DOCS_URL, Value: !Sub 'https://${DomainName}/api/v1/docs' }
+            - { Name: PROWLER_MCP_SERVER_URL, Value: 'http://mcp-server.prowler:8000/mcp' }
+            - { Name: NEXT_PUBLIC_PROWLER_RELEASE_VERSION, Value: v5.16.0 }
+            - { Name: UI_PORT, Value: '3000' }
+          Secrets:
+            - Name: AUTH_SECRET
+              ValueFrom: !Ref AuthSecretSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ui
+
+  # ---------------------------------------------------------------------------
+  # ECS Services
+  # ---------------------------------------------------------------------------
+  PostgresService:
+    Type: AWS::ECS::Service
+    DependsOn: [EFSMountTarget1, EFSMountTarget2]
+    Properties:
+      ServiceName: !Sub '${EnvironmentPrefix}-postgres'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref PostgresTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref DataSecurityGroup]
+          AssignPublicIp: ENABLED
+      ServiceRegistries:
+        - RegistryArn: !GetAtt PostgresDiscovery.Arn
+
+  ValkeyService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub '${EnvironmentPrefix}-valkey'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ValkeyTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref DataSecurityGroup]
+          AssignPublicIp: ENABLED
+      ServiceRegistries:
+        - RegistryArn: !GetAtt ValkeyDiscovery.Arn
+
+  Neo4jService:
+    Type: AWS::ECS::Service
+    DependsOn: [EFSMountTarget1, EFSMountTarget2]
+    Properties:
+      ServiceName: !Sub '${EnvironmentPrefix}-neo4j'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref Neo4jTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref DataSecurityGroup]
+          AssignPublicIp: ENABLED
+      ServiceRegistries:
+        - RegistryArn: !GetAtt Neo4jDiscovery.Arn
+
+  APIService:
+    Type: AWS::ECS::Service
+    DependsOn: [PostgresService, ValkeyService, Neo4jService, APIListenerRule]
+    Properties:
+      ServiceName: !Sub '${EnvironmentPrefix}-api'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref APITaskDef
+      DesiredCount: 0
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      HealthCheckGracePeriodSeconds: 180
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref AppSecurityGroup]
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8080
+          TargetGroupArn: !Ref APITargetGroup
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: prowler
+        Services:
+          - PortName: api
+            DiscoveryName: prowler-api
+            ClientAliases:
+              - Port: 8080
+
+  WorkerService:
+    Type: AWS::ECS::Service
+    DependsOn: [APIService]
+    Properties:
+      ServiceName: !Sub '${EnvironmentPrefix}-worker'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref WorkerTaskDef
+      DesiredCount: 0
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref AppSecurityGroup]
+          AssignPublicIp: ENABLED
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: prowler
+
+  WorkerBeatService:
+    Type: AWS::ECS::Service
+    DependsOn: [APIService]
+    Properties:
+      ServiceName: !Sub '${EnvironmentPrefix}-worker-beat'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref WorkerBeatTaskDef
+      DesiredCount: 0
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref AppSecurityGroup]
+          AssignPublicIp: ENABLED
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: prowler
+
+  MCPService:
+    Type: AWS::ECS::Service
+    DependsOn: [APIService]
+    Properties:
+      ServiceName: !Sub '${EnvironmentPrefix}-mcp'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref MCPTaskDef
+      DesiredCount: 0
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref AppSecurityGroup]
+          AssignPublicIp: ENABLED
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: prowler
+        Services:
+          - PortName: mcp
+            DiscoveryName: mcp-server
+            ClientAliases:
+              - Port: 8000
+
+  UIService:
+    Type: AWS::ECS::Service
+    DependsOn: [APIService, MCPService, HTTPSListener]
+    Properties:
+      ServiceName: !Sub '${EnvironmentPrefix}-ui'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref UITaskDef
+      DesiredCount: 0
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref AppSecurityGroup]
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - ContainerName: ui
+          ContainerPort: 3000
+          TargetGroupArn: !Ref UITargetGroup
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: prowler
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  ALBDNSName:
+    Description: ALB DNS name - point your domain CNAME/Alias to this value
+    Value: !GetAtt ALB.DNSName
+
+  ProwlerURL:
+    Description: Prowler application URL (after DNS is configured)
+    Value: !Sub 'https://${DomainName}'
+
+  ECSClusterName:
+    Description: ECS Cluster name for CLI operations
+    Value: !Ref ECSCluster
+
+  LogGroupName:
+    Description: CloudWatch Log Group for all services
+    Value: !Ref LogGroup
+
+  PostDeploymentSteps:
+    Description: Steps to complete after deployment
+    Value: !Sub |
+      1. Generate RSA keypair: openssl genrsa -out private.pem 2048 && openssl rsa -in private.pem -pubout -out public.pem
+      2. Populate JWT secrets:
+         aws secretsmanager put-secret-value --secret-id ${EnvironmentPrefix}/jwt-signing-key --secret-string file://private.pem
+         aws secretsmanager put-secret-value --secret-id ${EnvironmentPrefix}/jwt-verifying-key --secret-string file://public.pem
+      3. Point DNS: Create a CNAME or Route53 Alias for ${DomainName} -> ${ALB.DNSName}
+      4. Scale up services:
+         aws ecs update-service --cluster ${ECSCluster} --service ${EnvironmentPrefix}-api --desired-count 1
+         aws ecs update-service --cluster ${ECSCluster} --service ${EnvironmentPrefix}-worker --desired-count 2
+         aws ecs update-service --cluster ${ECSCluster} --service ${EnvironmentPrefix}-worker-beat --desired-count 1
+         aws ecs update-service --cluster ${ECSCluster} --service ${EnvironmentPrefix}-mcp --desired-count 1
+         aws ecs update-service --cluster ${ECSCluster} --service ${EnvironmentPrefix}-ui --desired-count 1
+      5. Wait for services to stabilize (5-10 minutes)
+      6. Navigate to https://${DomainName} and sign up (first user becomes tenant owner)
