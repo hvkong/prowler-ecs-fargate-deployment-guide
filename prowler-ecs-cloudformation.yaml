@@ -643,8 +643,8 @@ Resources:
       Family: !Sub '${EnvironmentPrefix}-postgres'
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
-      Cpu: '512'
-      Memory: '1024'
+      Cpu: '1024'
+      Memory: '4096'
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       TaskRoleArn: !GetAtt TaskRole.Arn
       Volumes:
@@ -693,8 +693,8 @@ Resources:
       Family: !Sub '${EnvironmentPrefix}-valkey'
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
-      Cpu: '256'
-      Memory: '512'
+      Cpu: '1024'
+      Memory: '4096'
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       TaskRoleArn: !GetAtt TaskRole.Arn
       ContainerDefinitions:
@@ -725,7 +725,7 @@ Resources:
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
       Cpu: '1024'
-      Memory: '3072'
+      Memory: '4096'
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       TaskRoleArn: !GetAtt TaskRole.Arn
       Volumes:
@@ -771,7 +771,7 @@ Resources:
               ValueFrom: !Ref Neo4jAuthSecret
           HealthCheck:
             Command: ['CMD-SHELL', 'wget --no-verbose -O /dev/null http://localhost:7474 || exit 1']
-            Interval: 15
+            Interval: 30
             Timeout: 10
             Retries: 10
             StartPeriod: 120
@@ -830,6 +830,7 @@ Resources:
             - { Name: DJANGO_BROKER_VISIBILITY_TIMEOUT, Value: '86400' }
             - { Name: DJANGO_THROTTLE_TOKEN_OBTAIN, Value: '50/minute' }
             - { Name: DJANGO_CORS_ALLOWED_ORIGINS, Value: !Sub 'https://${DomainName}' }
+            - { Name: SAML_SSO_CALLBACK_URL, Value: !Sub 'https://${DomainName}/api/auth/callback/saml' }
             - { Name: POSTGRES_HOST, Value: postgres.prowler }
             - { Name: POSTGRES_PORT, Value: '5432' }
             - { Name: POSTGRES_ADMIN_USER, Value: prowler_admin }
@@ -874,7 +875,7 @@ Resources:
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
       Cpu: '2048'
-      Memory: '4096'
+      Memory: '8192'
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       TaskRoleArn: !GetAtt TaskRole.Arn
       Volumes:
@@ -909,11 +910,15 @@ Resources:
             - { Name: DJANGO_MANAGE_DB_PARTITIONS, Value: 'True' }
             - { Name: DJANGO_ACCESS_TOKEN_LIFETIME, Value: !Sub '${DjangoAccessTokenLifetime}' }
             - { Name: DJANGO_REFRESH_TOKEN_LIFETIME, Value: '1440' }
+            - { Name: DJANGO_CACHE_MAX_AGE, Value: '3600' }
+            - { Name: DJANGO_STALE_WHILE_REVALIDATE, Value: '60' }
             - { Name: DJANGO_BROKER_VISIBILITY_TIMEOUT, Value: '86400' }
+            - { Name: DJANGO_THROTTLE_TOKEN_OBTAIN, Value: '50/minute' }
             - { Name: DJANGO_CORS_ALLOWED_ORIGINS, Value: !Sub 'https://${DomainName}' }
             - { Name: POSTGRES_HOST, Value: postgres.prowler }
             - { Name: POSTGRES_PORT, Value: '5432' }
             - { Name: POSTGRES_ADMIN_USER, Value: prowler_admin }
+            - { Name: POSTGRES_USER, Value: prowler_admin }
             - { Name: POSTGRES_DB, Value: prowler_db }
             - { Name: VALKEY_HOST, Value: valkey.prowler }
             - { Name: VALKEY_PORT, Value: '6379' }
@@ -947,8 +952,8 @@ Resources:
       Family: !Sub '${EnvironmentPrefix}-worker-beat'
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
-      Cpu: '256'
-      Memory: '512'
+      Cpu: '2048'
+      Memory: '8192'
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       TaskRoleArn: !GetAtt TaskRole.Arn
       ContainerDefinitions:
@@ -968,12 +973,18 @@ Resources:
             - { Name: DJANGO_DEBUG, Value: 'False' }
             - { Name: DJANGO_LOGGING_FORMATTER, Value: human_readable }
             - { Name: DJANGO_LOGGING_LEVEL, Value: INFO }
+            - { Name: DJANGO_WORKERS, Value: '2' }
+            - { Name: DJANGO_MANAGE_DB_PARTITIONS, Value: 'True' }
             - { Name: DJANGO_ACCESS_TOKEN_LIFETIME, Value: !Sub '${DjangoAccessTokenLifetime}' }
             - { Name: DJANGO_REFRESH_TOKEN_LIFETIME, Value: '1440' }
+            - { Name: DJANGO_CACHE_MAX_AGE, Value: '3600' }
+            - { Name: DJANGO_STALE_WHILE_REVALIDATE, Value: '60' }
             - { Name: DJANGO_BROKER_VISIBILITY_TIMEOUT, Value: '86400' }
+            - { Name: DJANGO_THROTTLE_TOKEN_OBTAIN, Value: '50/minute' }
             - { Name: POSTGRES_HOST, Value: postgres.prowler }
             - { Name: POSTGRES_PORT, Value: '5432' }
             - { Name: POSTGRES_ADMIN_USER, Value: prowler_admin }
+            - { Name: POSTGRES_USER, Value: prowler_admin }
             - { Name: POSTGRES_DB, Value: prowler_db }
             - { Name: VALKEY_HOST, Value: valkey.prowler }
             - { Name: VALKEY_PORT, Value: '6379' }
@@ -1007,8 +1018,8 @@ Resources:
       Family: !Sub '${EnvironmentPrefix}-mcp'
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
-      Cpu: '256'
-      Memory: '512'
+      Cpu: '1024'
+      Memory: '4096'
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       TaskRoleArn: !GetAtt TaskRole.Arn
       ContainerDefinitions:
@@ -1043,8 +1054,8 @@ Resources:
       Family: !Sub '${EnvironmentPrefix}-ui'
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
-      Cpu: '512'
-      Memory: '1024'
+      Cpu: '1024'
+      Memory: '4096'
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       TaskRoleArn: !GetAtt TaskRole.Arn
       ContainerDefinitions:
