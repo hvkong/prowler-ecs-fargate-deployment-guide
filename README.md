@@ -17,59 +17,84 @@ settings and multi-AZ.
 | Worker | `prowlercloud/prowler-api:stable` (Docker Hub) | — | Celery worker for scans |
 | Worker-Beat | `prowlercloud/prowler-api:stable` (Docker Hub) | — | Celery scheduler |
 | MCP Server | `prowlercloud/prowler-mcp:stable` (Docker Hub) | 8000 | AI assistant features |
-| UI | Custom ECR image (see below) | 3000 | Next.js frontend |
+| UI | `prowlercloud/prowler-ui:stable` (Docker Hub) or custom ECR | 3000 | Next.js frontend |
 
-### Why the UI Needs a Custom Image (No Code Changes Required)
+### Image Update Policy
+
+**Prowler services (API, Worker, Worker-Beat, MCP, UI):** These use the `stable` tag which
+tracks the latest release. Prowler publishes new `stable` tags with each release. To update,
+force a new deployment on the ECS service — Fargate pulls the latest image for the tag. No
+data migration is involved. If you prefer deterministic deployments, pin to a version tag
+(e.g. `5.32.0`) and update it explicitly during maintenance.
+
+**Data stores (Postgres, Valkey, Neo4j):** These are pinned to exact versions intentionally.
+Treat version changes as infrastructure upgrades, not routine updates:
+
+| Store | Update Risk | Before Upgrading |
+|-------|-------------|------------------|
+| Postgres | Major versions (e.g. 16→17) require `pg_upgrade` or dump/restore. Minor versions within the same major (e.g. 16.3→16.8) are safe. | Back up EFS, test in a throwaway environment, plan downtime. |
+| Valkey | Major versions may change persistence format or protocol. Minor patches within v7 are safe. | Back up EFS (if using persistence), verify client compatibility. |
+| Neo4j/DozerDB | Store format may change between versions. APOC plugin compatibility varies. | Back up the `/data` EFS volume. Check DozerDB release notes for store migration steps. Scale Neo4j to 0, back up, then upgrade. |
+
+> Tip: When updating data store versions, update the task definition with the new image
+> first (without changing desired count). Then scale the service to 0, confirm data backups,
+> and scale back to 1. The new task definition revision picks up on the next launch.
+
+### Why the UI Previously Needed a Custom Image
+
+> **Update (v5.32.0+):** The Prowler team has refactored the UI to read the API URL at
+> runtime via `UI_API_BASE_URL` (or the legacy `NEXT_PUBLIC_API_BASE_URL` as a fallback).
+> The URL is no longer inlined at build time. If the published `prowlercloud/prowler-ui:stable`
+> image reflects this change, you can skip building a custom image entirely and set
+> `UI_API_BASE_URL=http://prowler-api.prowler:8080/api/v1` as a runtime environment variable
+> in the ECS task definition. The custom image approach below remains valid for pinning a
+> specific release version string or if the published `stable` tag has not yet been updated.
 
 The only custom image in this deployment is the UI. No application code was modified. The
 custom image uses the exact same source code and Dockerfile from the Prowler repository.
 The only difference is the build argument value passed during `docker build`.
 
-**The problem:**
+**Background (pre-v5.32.0 behavior):**
 
-The published `prowlercloud/prowler-ui:stable` image is built by the Prowler CI pipeline
-(`.github/workflows/ui-container-build-push.yml`) with this build arg:
-
-```
-NEXT_PUBLIC_API_BASE_URL=http://prowler-api:8080/api/v1
-```
-
-Next.js inlines `NEXT_PUBLIC_*` environment variables as string literals into the compiled
-JavaScript during `next build`. This means the URL `http://prowler-api:8080/api/v1` is
-hardcoded into the JS bundle and cannot be overridden by setting environment variables at
-runtime. This is standard Next.js behavior, not a Prowler bug.
+Prior to v5.32.0, the published `prowlercloud/prowler-ui:stable` image was built by the
+Prowler CI pipeline with the build arg `NEXT_PUBLIC_API_BASE_URL=http://prowler-api:8080/api/v1`.
+Next.js inlined `NEXT_PUBLIC_*` environment variables as string literals into the compiled
+JavaScript during `next build`, making the URL immutable at runtime.
 
 The hostname `prowler-api` works in docker-compose because Docker Compose creates a network
 where bare service names resolve automatically (the API service has `hostname: "prowler-api"`
 in docker-compose.yml). In ECS with Service Connect, hostnames require the namespace suffix
 (e.g. `prowler-api.prowler`). Bare names like `prowler-api` do not resolve.
 
-This is a known issue: https://github.com/prowler-cloud/prowler/issues/8211
+This was tracked as: https://github.com/prowler-cloud/prowler/issues/8211
 
-**Workaround:**
+**How it was resolved upstream:**
 
-Rebuilt the UI image with a different build arg value:
+The Prowler team refactored `ui/lib/helper.ts` to use a `readEnv()` function that reads
+environment variables via computed property access (e.g. `process.env[key]`), which Next.js
+does NOT inline at build time. The new primary env var is `UI_API_BASE_URL`, with
+`NEXT_PUBLIC_API_BASE_URL` kept as a deprecated runtime fallback. The CI workflow now only
+passes `NEXT_PUBLIC_PROWLER_RELEASE_VERSION` as a build arg — no API URL.
 
-```
-NEXT_PUBLIC_API_BASE_URL=http://prowler-api.prowler:8080/api/v1
-```
+**Why a custom build may still be useful:**
 
-This is the same build process the Prowler team uses, just with a URL that includes the
-ECS Service Connect namespace suffix (`.prowler`). The Dockerfile exposes
-`NEXT_PUBLIC_API_BASE_URL` as a build arg specifically for this customization.
+If you want to pin a specific release version string in the UI or if the published Docker Hub
+`stable` tag hasn't been updated to include this refactoring, building from source ensures
+you have the runtime env var support.
 
-**What this affects:**
+**What the `UI_API_BASE_URL` value affects:**
 
-The `NEXT_PUBLIC_API_BASE_URL` value (via `apiBaseUrl` in `ui/lib/helper.ts`) is used by
-every Next.js server action that calls the Django API. This includes sign-up, sign-in,
-token refresh, provider management, scan management, compliance, findings, roles,
-invitations, integrations, attack paths, and Lighthouse AI — essentially every feature.
+The `UI_API_BASE_URL` value (via `apiBaseUrl` in `ui/lib/helper.ts`) is used by every
+Next.js server action that calls the Django API. This includes sign-up, sign-in, token
+refresh, provider management, scan management, compliance, findings, roles, invitations,
+integrations, attack paths, and Lighthouse AI — essentially every feature.
 
 It is also used client-side in one place: the SAML SSO configuration form displays the
 ACS URL using this value. If you set up SAML, the displayed ACS URL will show the internal
-hostname. You would manually enter the correct public URL in your identity provider instead
-of copying the displayed one. There is no cryptographic signature involved. The ACS URL is
-just a callback endpoint configured on both sides independently.
+hostname (e.g. `http://prowler-api.prowler:8080/api/v1/accounts/saml/.../acs/`). You would
+manually enter the correct public URL in your identity provider instead of copying the
+displayed one. There is no cryptographic signature involved. The ACS URL is just a callback
+endpoint configured on both sides independently.
 
 **What was NOT changed:**
 
@@ -93,9 +118,9 @@ which is why the ALB rule uses `/api/v1/*` not `/api/*`.
 
 When a user performs any action (sign up, sign in, view findings, run scans), the browser
 POSTs to the UI's Next.js server action. The server action then calls the Django API using
-the URL baked into the JS bundle (`http://prowler-api.prowler:8080/api/v1`). This call
-happens inside the UI container, goes through the Service Connect Envoy sidecar, and reaches
-the API container. The user's JWT token is passed along in the Authorization header.
+the URL from the `UI_API_BASE_URL` runtime environment variable (`http://prowler-api.prowler:8080/api/v1`).
+This call happens inside the UI container, goes through the Service Connect Envoy sidecar,
+and reaches the API container. The user's JWT token is passed along in the Authorization header.
 
 **UI → MCP Server → API (Lighthouse AI):**
 
@@ -123,7 +148,7 @@ also publishes tasks (e.g. when a user triggers a scan) to Valkey for workers to
 
 | Connection | Hostname | Resolution Method | Why |
 |---|---|---|---|
-| UI → API | `prowler-api.prowler` | Service Connect | Baked into UI image, HTTP protocol works with Envoy |
+| UI → API | `prowler-api.prowler` | Service Connect | Runtime env var `UI_API_BASE_URL`, HTTP protocol works with Envoy |
 | UI → MCP | `mcp-server.prowler` | Service Connect | Runtime env var, HTTP protocol |
 | MCP → API | `prowler-api.prowler` | Service Connect | Runtime env var `API_BASE_URL`, HTTP protocol |
 | API → Postgres | `postgres.prowler` | Cloud Map DNS | Runtime env var, binary protocol (no Envoy) |
@@ -269,10 +294,14 @@ If `ecsTaskExecutionRole` doesn't exist, create it:
 
 This role also needs ECR pull permissions (included in the managed policy).
 
-### Task Role (optional)
-Create a task role if you need ECS Exec or S3 output:
-- Same trust policy as above
-- For ECS Exec, add inline policy:
+### Task Role
+Create a task role for the Prowler containers. This role is used by the running containers
+(as opposed to the execution role which is used by ECS itself to pull images and write logs).
+
+- Trusted entity: AWS Service → Elastic Container Service → Elastic Container Service Task
+- Attach inline policies:
+
+**ECS Exec (for troubleshooting):**
 ```json
 {
     "Version": "2012-10-17",
@@ -291,9 +320,98 @@ Create a task role if you need ECS Exec or S3 output:
 }
 ```
 
+**Assume Role for Scanning:**
+
+The Worker container needs `sts:AssumeRole` to assume the target role in the account(s)
+being scanned. This same permission also covers S3 and SecurityHub integrations when they
+use role assumption.
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": "sts:AssumeRole",
+            "Resource": "arn:aws:iam::<TARGET_ACCOUNT_ID>:role/ProwlerScan"
+        }
+    ]
+}
+```
+
+Replace `<TARGET_ACCOUNT_ID>` with the 12-digit account ID you want to scan, or use `*`
+to allow scanning any account (resource becomes `arn:aws:iam::*:role/ProwlerScan`).
+Replace `ProwlerScan` with the actual role name if different.
+
+> Note: This permission allows the Worker to call `sts:AssumeRole`. The actual access
+> to AWS resources during the scan is governed by the policies attached to the target
+> role (ProwlerScan), not this task role. The task role does not need SecurityAudit or
+> ViewOnlyAccess — those go on the target role.
+>
+> For setting up the ProwlerScan role in the target account, see [ProwlerScan.md](ProwlerScan.md).
+
 ---
 
-## Step 6: Generate JWT Signing Keys
+## Step 6: Generate Credentials and Secrets
+
+Generate all passwords and encryption keys before creating task definitions. These values
+will be referenced across multiple services.
+
+### 6.1 — Database Passwords (Postgres and Neo4j)
+
+Choose passwords for PostgreSQL and Neo4j. These are used both by the database containers
+themselves and by the application services that connect to them.
+
+**Requirements:**
+- Minimum 8 characters (longer is better)
+- Use alphanumeric characters and these safe special characters: `!@#%^&*()-_=+.`
+- **Avoid these characters:** `/` (breaks Neo4j auth format), `$` (interpreted by shell
+  and CloudFormation `!Sub`), `"` (breaks JSON), `\` (escape character), backticks
+
+**Option A — Generate random passwords:**
+```bash
+# 16-byte random, base64-encoded (22 chars, safe alphabet)
+openssl rand -base64 16
+```
+
+**Option B — Choose memorable passwords:**
+Use any combination of allowed characters. Example: `pr0wlerDEM0!sec`
+
+> Note: The Neo4j container receives its password in the format `neo4j/<password>` via the
+> `NEO4J_AUTH` environment variable. If your password contains `/`, Neo4j will split on
+> the wrong delimiter and authentication will fail.
+
+### 6.2 — Django Secrets Encryption Key
+
+This key encrypts provider credentials (AWS keys, etc.) stored in the Prowler database.
+It must be exactly 32 bytes, base64-encoded.
+
+```bash
+openssl rand -base64 32
+```
+
+Output example: `DvEl5bVIDL3wp76rr7EAyNFOJKjQMiRB29huXkbLb20=`
+
+Set this as `DJANGO_SECRETS_ENCRYPTION_KEY` on the API, Worker, and Worker-Beat task
+definitions. All three must have the same value. If you lose this key, all stored provider
+credentials become unreadable and must be re-entered.
+
+### 6.3 — Auth.js Session Secret
+
+This key encrypts browser session cookies in the UI container.
+
+```bash
+openssl rand -base64 32
+```
+
+Output example: `g2hTrzlf6rtfAiMpOi4L8dQ2Jfj2KKAW5VJcRKgZyxY=`
+
+Set this as `AUTH_SECRET` on the UI task definition. Changing this value invalidates all
+active browser sessions (users must sign in again).
+
+---
+
+## Step 7: Generate JWT Signing Keys
 
 The API uses RSA keys to sign and verify JWT tokens. By default, the API auto-generates
 keys on first boot and stores them on the container's ephemeral filesystem. In Fargate,
@@ -303,13 +421,13 @@ and causing 401 errors across the system (including Lighthouse AI).
 Generate a static key pair and configure it on the API, Worker, and Worker-Beat task
 definitions so tokens survive restarts.
 
-### 6.1 — Generate RSA Key Pair
+### 7.1 — Generate RSA Key Pair
 ```bash
 openssl genrsa -out private.pem 2048
 openssl rsa -in private.pem -pubout -out public.pem
 ```
 
-### 6.2 — Convert to Single-Line Format
+### 7.2 — Convert to Single-Line Format
 ECS environment variables don't support multi-line values. Convert newlines to literal
 `\n` escape sequences:
 ```bash
@@ -324,7 +442,7 @@ converts the literal `\n` strings back to real newlines at runtime.
 > sequences are preserved as literal characters in the string value, not converted to
 > spaces. Verify by checking the JSON shows `\\n` between PEM lines.
 
-### 6.3 — Set on Task Definitions
+### 7.3 — Set on Task Definitions
 Add these environment variables to API, Worker, and Worker-Beat task definitions:
 - `DJANGO_TOKEN_SIGNING_KEY` = the single-line private key output
 - `DJANGO_TOKEN_VERIFYING_KEY` = the single-line public key output
@@ -333,28 +451,33 @@ All three must have identical values. Delete the local PEM files after configuri
 
 ---
 
-## Step 7: Build and Push Custom UI Image
+## Step 8: Build and Push Custom UI Image (Optional)
 
-### 7.1 — Create ECR Repository
+> **This step is optional.** With Prowler v5.32.0+, the published `prowlercloud/prowler-ui:stable`
+> image works directly with ECS Service Connect. The API URL is configured at runtime via
+> `UI_API_BASE_URL`. Skip to Step 9 if you don't need to pin a specific version string.
+
+If you want to pin a specific release version or use a known-good image build:
+
+### 8.1 — Create ECR Repository
 Go to **ECR → Create repository**:
 - Visibility: Private
 - Name: `prowler-ui` (or your preferred name)
 
-### 7.2 — Build the Image
+### 8.2 — Build the Image
 From the root of the Prowler repo:
 ```bash
 docker build --target prod \
-  --build-arg NEXT_PUBLIC_API_BASE_URL=http://prowler-api.prowler:8080/api/v1 \
-  --build-arg NEXT_PUBLIC_PROWLER_RELEASE_VERSION=v5.16.0 \
+  --build-arg NEXT_PUBLIC_PROWLER_RELEASE_VERSION=v5.32.0 \
   -t <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/<REPO_NAME>:stable \
   -f ui/Dockerfile \
   ui/
 ```
 
-The `NEXT_PUBLIC_API_BASE_URL` must match the Service Connect discovery name you'll use
-for the API service (`prowler-api`) plus the namespace suffix (`.prowler`).
+The only build arg needed is the release version string. The API URL is now configured at
+runtime via the `UI_API_BASE_URL` environment variable in the ECS task definition.
 
-### 7.3 — Push to ECR
+### 8.3 — Push to ECR
 ```bash
 aws ecr get-login-password --region <REGION> | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
 
@@ -363,7 +486,7 @@ docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/<REPO_NAME>:stable
 
 ---
 
-## Step 8: Task Definitions
+## Step 9: Task Definitions
 
 Common settings for all task definitions:
 - Launch type: AWS Fargate
@@ -371,8 +494,8 @@ Common settings for all task definitions:
 - Task execution role: your execution role
 - Network mode: awsvpc
 
-### 8.1 — Postgres
-- CPU: 0.5 vCPU, Memory: 1 GB (or larger)
+### 9.1 — Postgres
+- CPU: 1 vCPU, Memory: 4 GB
 - Container name: `postgres`
 - Image: `postgres:16.3-alpine3.20`
 - Port: 5432 TCP (name: `postgres`, **no appProtocol** — remove via JSON if console forces a value)
@@ -385,8 +508,8 @@ Common settings for all task definitions:
 - Volume: EFS, your file system ID, postgres access point, transit encryption enabled
   - Mount: `/var/lib/postgresql/data`
 
-### 8.2 — Valkey
-- CPU: 0.25 vCPU, Memory: 0.5 GB
+### 9.2 — Valkey
+- CPU: 1 vCPU, Memory: 4 GB
 - Container name: `valkey`
 - Image: `valkey/valkey:7-alpine3.19`
 - Port: 6379 TCP (name: `valkey`, **no appProtocol**)
@@ -394,8 +517,8 @@ Common settings for all task definitions:
   - Interval: 10, Timeout: 5, Retries: 3, Start period: 10
 - No volumes
 
-### 8.3 — Neo4j
-- CPU: 1 vCPU, Memory: 3 GB
+### 9.3 — Neo4j
+- CPU: 1 vCPU, Memory: 4 GB
 - Container name: `neo4j`
 - Image: `graphstack/dozerdb:5.26.3.0`
 - Ports:
@@ -411,13 +534,13 @@ Common settings for all task definitions:
   - `NEO4J_dbms_security_procedures_allowlist` = `apoc.*`
   - `dbms.connector.bolt.listen_address` = `0.0.0.0:7687`
 - Health check: `CMD-SHELL,wget --no-verbose -O /dev/null http://localhost:7474 || exit 1`
-  - Interval: 15, Timeout: 10, Retries: 10, Start period: 60
+  - Interval: 30, Timeout: 10, Retries: 10, Start period: 120
 - Volume: EFS, your file system ID, neo4j access point, transit encryption enabled
   - Mount: `/data`
 
 
-### 8.4 — API
-- CPU: 0.5 vCPU, Memory: 1 GB (or larger)
+### 9.4 — API
+- CPU: 1 vCPU, Memory: 4 GB
 - Container name: `api`
 - Image: `prowlercloud/prowler-api:stable`
 - Port: 8080 TCP (name: `api`, appProtocol: `http`)
@@ -433,8 +556,8 @@ Common settings for all task definitions:
   - `DJANGO_WORKERS` = `2`
   - `DJANGO_MANAGE_DB_PARTITIONS` = `True`
   - `DJANGO_SECRETS_ENCRYPTION_KEY` = `<generate: openssl rand -base64 32>`
-  - `DJANGO_TOKEN_SIGNING_KEY` = `<single-line private key from Step 6>`
-  - `DJANGO_TOKEN_VERIFYING_KEY` = `<single-line public key from Step 6>`
+  - `DJANGO_TOKEN_SIGNING_KEY` = `<single-line private key from Step 7>`
+  - `DJANGO_TOKEN_VERIFYING_KEY` = `<single-line public key from Step 7>`
   - `DJANGO_ACCESS_TOKEN_LIFETIME` = `180`
   - `DJANGO_REFRESH_TOKEN_LIFETIME` = `1440`
   - `DJANGO_CACHE_MAX_AGE` = `3600`
@@ -470,8 +593,8 @@ Common settings for all task definitions:
 > pipelines. The worker processes tasks using the user's JWT token, and a full scan with
 > output generation and integrations can take 30-60+ minutes.
 
-### 8.5 — Worker
-- CPU: 1 vCPU, Memory: 2 GB
+### 9.5 — Worker
+- CPU: 2 vCPU, Memory: 8 GB
 - Container name: `worker`
 - Image: `prowlercloud/prowler-api:stable`
 - No port mappings
@@ -486,8 +609,8 @@ Common settings for all task definitions:
 > reports and output files here, and the API reads from the same path to serve downloads.
 > Without this shared mount, report downloads will fail.
 
-### 8.6 — Worker-Beat
-- CPU: 0.25 vCPU, Memory: 0.5 GB
+### 9.6 — Worker-Beat
+- CPU: 2 vCPU, Memory: 8 GB
 - Container name: `worker-beat`
 - Image: `prowlercloud/prowler-api:stable`
 - No port mappings
@@ -498,8 +621,8 @@ Common settings for all task definitions:
 
 > Never run more than 1 beat instance. Always set desired count to exactly 1.
 
-### 8.7 — MCP Server
-- CPU: 0.25 vCPU, Memory: 0.5 GB
+### 9.7 — MCP Server
+- CPU: 1 vCPU, Memory: 4 GB
 - Container name: `mcp-server`
 - Image: `prowlercloud/prowler-mcp:stable`
 - Port: 8000 TCP (name: `mcp`, appProtocol: `http`)
@@ -514,32 +637,33 @@ Common settings for all task definitions:
 > the MCP server defaults to `https://api.prowler.com/api/v1` (the Prowler SaaS endpoint)
 > and all app tool calls will fail.
 
-### 8.8 — UI
-- CPU: 0.25 vCPU, Memory: 0.5 GB (or larger)
+### 9.8 — UI
+- CPU: 1 vCPU, Memory: 4 GB
 - Container name: `ui`
-- Image: `<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/<REPO_NAME>:stable` (your custom ECR image)
+- Image: `prowlercloud/prowler-ui:stable` (or custom ECR image if pinning a version)
 - Port: 3000 TCP (name: `ui`, appProtocol: `http`)
 - Environment variables:
-  - `NEXT_PUBLIC_API_BASE_URL` = `http://prowler-api.prowler:8080/api/v1` (cosmetic — baked into image)
-  - `API_BASE_URL` = `http://prowler-api.prowler:8080/api/v1` (cosmetic — not used by code)
+  - `UI_API_BASE_URL` = `http://prowler-api.prowler:8080/api/v1` (runtime, required — used by all server actions)
   - `AUTH_URL` = `https://<your-domain>` (runtime, used by Auth.js)
   - `AUTH_SECRET` = `<generate: openssl rand -base64 32>` (runtime)
   - `AUTH_TRUST_HOST` = `true` (runtime)
-  - `NEXT_PUBLIC_API_DOCS_URL` = `https://<your-domain>/api/v1/docs` (baked, cosmetic)
+  - `UI_API_DOCS_URL` = `https://<your-domain>/api/v1/docs` (runtime, cosmetic)
   - `PROWLER_MCP_SERVER_URL` = `http://mcp-server.prowler:8000/mcp` (runtime)
-  - `NEXT_PUBLIC_PROWLER_RELEASE_VERSION` = `v5.16.0` (baked, cosmetic)
+  - `NEXT_PUBLIC_PROWLER_RELEASE_VERSION` = `v5.32.0` (baked at build time, cosmetic)
   - `UI_PORT` = `3000` (runtime)
 - No health check needed (the Dockerfile sets `HOSTNAME=0.0.0.0` but the ALB health check
   on the target group handles liveness)
 
-> The `NEXT_PUBLIC_*` env vars are baked into the image at build time and ignored at runtime.
-> They are included in the task definition for documentation purposes only.
+> `UI_API_BASE_URL` is the primary runtime env var that controls which API endpoint the
+> UI calls. It must include the Service Connect namespace suffix (`.prowler`) so the
+> hostname resolves within the ECS cluster. The legacy `NEXT_PUBLIC_API_BASE_URL` is
+> accepted as a fallback but deprecated.
 
 ---
 
-## Step 9: Application Load Balancer
+## Step 10: Application Load Balancer
 
-### 9.1 — Create ALB
+### 10.1 — Create ALB
 Go to **EC2 → Load Balancers → Create → Application Load Balancer**.
 - Name: `prowler-alb`
 - Scheme: Internet-facing
@@ -547,7 +671,7 @@ Go to **EC2 → Load Balancers → Create → Application Load Balancer**.
 - Security group: `prowler-alb-sg`
 - Listener: HTTP:80 (add HTTPS:443 later with ACM certificate)
 
-### 9.2 — Create Target Groups
+### 10.2 — Create Target Groups
 Create three target groups (Target type: IP, VPC: default, do not register targets):
 
 | Target Group | Protocol/Port | Health Check Path | Success Codes |
@@ -558,7 +682,7 @@ Create three target groups (Target type: IP, VPC: default, do not register targe
 
 > The UI returns 302 redirects on `/` (to sign-in page), so include 302 and 307 in success codes.
 
-### 9.3 — Listener Rules
+### 10.3 — Listener Rules
 On the HTTP:80 listener (or HTTPS:443 if configured):
 
 | Priority | Condition | Action |
@@ -573,7 +697,7 @@ Add the MCP target group only if you need browser-direct MCP access (usually not
 
 ---
 
-## Step 10: ECS Services
+## Step 11: ECS Services
 
 ### Service Connect Configuration Summary
 
@@ -595,7 +719,7 @@ Add the MCP target group only if you need browser-direct MCP access (usually not
 
 **Phase 1 — Data services (no dependencies):**
 
-### 10.1 — Postgres
+### 11.1 — Postgres
 - Task definition: `prowler-postgres`
 - Desired tasks: 1
 - Service Connect: None — use Service Discovery (Cloud Map DNS)
@@ -605,11 +729,11 @@ Add the MCP target group only if you need browser-direct MCP access (usually not
 - Security group: `prowler-data-sg`
 - Public IP: Enabled
 
-### 10.2 — Valkey
+### 11.2 — Valkey
 - Same pattern as Postgres
 - Service discovery name: `valkey`
 
-### 10.3 — Neo4j
+### 11.3 — Neo4j
 - Same pattern as Postgres
 - Service discovery name: `neo4j`
 
@@ -617,7 +741,7 @@ Add the MCP target group only if you need browser-direct MCP access (usually not
 
 **Phase 2 — API (needs Postgres, Valkey, Neo4j):**
 
-### 10.4 — API
+### 11.4 — API
 - Task definition: `prowler-api`
 - Desired tasks: 1
 - Service Connect: Client and Server
@@ -634,7 +758,7 @@ Add the MCP target group only if you need browser-direct MCP access (usually not
 
 **Phase 3 — Workers, MCP, UI:**
 
-### 10.5 — Worker
+### 11.5 — Worker
 - Task definition: `prowler-worker`
 - Desired tasks: 1
 - Service Connect: Client Side Only
@@ -642,7 +766,7 @@ Add the MCP target group only if you need browser-direct MCP access (usually not
 - Public IP: Enabled
 - No load balancer
 
-### 10.6 — Worker-Beat
+### 11.6 — Worker-Beat
 - Task definition: `prowler-worker-beat`
 - Desired tasks: 1 (never more)
 - Service Connect: Client Side Only
@@ -650,7 +774,7 @@ Add the MCP target group only if you need browser-direct MCP access (usually not
 - Public IP: Enabled
 - No load balancer
 
-### 10.7 — MCP Server
+### 11.7 — MCP Server
 - Task definition: `prowler-mcp`
 - Desired tasks: 1
 - Service Connect: Client and Server
@@ -660,7 +784,7 @@ Add the MCP target group only if you need browser-direct MCP access (usually not
 - Public IP: Enabled
 - Load balancer: `prowler-alb`, target group `prowler-mcp-tg`, container `mcp-server:8000`
 
-### 10.8 — UI
+### 11.8 — UI
 - Task definition: `prowler-ui`
 - Desired tasks: 1
 - Service Connect: Client Side Only
@@ -670,7 +794,7 @@ Add the MCP target group only if you need browser-direct MCP access (usually not
 
 ---
 
-## Step 11: Post-Deployment
+## Step 12: Post-Deployment
 
 ### DNS and HTTPS
 1. Point your domain to the ALB (Route 53 Alias record or CNAME)
@@ -684,6 +808,18 @@ definition matches your domain exactly (including `https://`).
 ### First Login
 Navigate to `https://<your-domain>` and sign up with email and password.
 There is no default admin account — the first user you create becomes the tenant owner.
+
+### Add AWS Provider (First Scan)
+After signing up, set up the ProwlerScan role in the account you want to scan:
+
+1. In the Prowler UI, go to **Providers → Add Provider → AWS → IAM Role**
+2. Copy the **External ID** shown (this is your tenant UUID, auto-generated)
+3. Deploy the `prowler-scan-role.yaml` template in the target account using that External ID
+4. Copy the Role ARN from the CloudFormation Outputs
+5. Paste the Role ARN in the Prowler UI and click **Connect**
+
+See [ProwlerScan.md](ProwlerScan.md) for the full setup guide including S3 and Security Hub
+integration options.
 
 ### SAML SSO Setup
 
@@ -702,11 +838,10 @@ In your IdP's SAML app configuration, set:
 - **Entity ID** (also called Audience URI or SP Entity ID): `urn:prowler.com:sp`
   - Note: terminology varies by IdP. Azure calls this "Identifier (Entity ID)".
 
-> The Prowler UI displays the ACS URL using the internal hostname baked into the image
+> The Prowler UI displays the ACS URL using the internal hostname from `UI_API_BASE_URL`
 > (e.g. `http://prowler-api.prowler:8080/api/v1/accounts/saml/.../acs/`). This is
-> cosmetic and incorrect for non-docker-compose deployments. Manually enter the correct
-> public URL in your IdP instead of copying the one shown in the UI. The `NEXT_PUBLIC_API_BASE_URL`
-> environment variable does not affect this — it is baked into the image at build time.
+> cosmetic and incorrect for external access. Manually enter the correct public URL in
+> your IdP instead of copying the one shown in the UI.
 
 **Step 3: Upload IdP metadata XML in Prowler:**
 
@@ -738,19 +873,19 @@ App Roles:
 
 ## Troubleshooting
 
-> **Note on Python paths:** The troubleshooting commands below reference the Poetry
-> virtualenv path `/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python`.
-> The `NnJNioq7` hash is generated by Poetry based on the project name and Python version,
-> and will change in future Prowler releases. These commands are based on Prowler v5.16.0.
-> For other versions, either update the hash in the commands or use a glob pattern:
+> **Note on Python commands:** The troubleshooting commands below use `uv run python manage.py`
+> which is the standard invocation inside the Prowler API container. The container's working
+> directory is `/home/prowler/backend` and `uv` manages the virtual environment automatically.
+> All commands should be run from within the API container via ECS Exec:
 > ```
-> /home/prowler/.cache/pypoetry/virtualenvs/*/bin/python manage.py shell -c "..."
+> aws ecs execute-command --cluster prowler --task <TASK_ID> --container api --interactive --command "/bin/sh"
 > ```
+> Once inside, run commands directly as shown (no path prefix needed).
 
 ### "Network error or server is unreachable" on sign-up/sign-in
 The UI's server actions can't reach the API. Verify:
 1. The API service's Service Connect discovery name is `prowler-api`
-2. The custom UI image was built with `NEXT_PUBLIC_API_BASE_URL=http://prowler-api.prowler:8080/api/v1`
+2. The `UI_API_BASE_URL` env var is set to `http://prowler-api.prowler:8080/api/v1`
 3. ECS Exec into the UI container and test: `wget -O - http://prowler-api.prowler:8080/api/v1/docs`
 
 ### 404 on `/api/auth/session`
@@ -779,7 +914,7 @@ task during a rolling deployment, OOM, or token expiry. The scan record remains 
 
 **Step 1: Identify stuck executing scans:**
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/*/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from api.models import Scan
 for s in Scan.objects.using('admin').filter(state='executing'):
     print(f'ID: {s.id}, Name: {s.name}, Provider: {s.provider_id}, Progress: {s.progress}, Started: {s.started_at}')
@@ -791,7 +926,7 @@ activity, it's stuck.
 
 **Step 2: Mark stuck scans as failed:**
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/*/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from api.models import Scan
 for s in Scan.objects.using('admin').filter(state='executing'):
     s.state = 'failed'
@@ -826,7 +961,7 @@ picks it up again.
 
 To diagnose, ECS Exec into the API container and check for stuck scans:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from api.models import Scan
 for s in Scan.objects.using('admin').filter(state='available', started_at__isnull=True):
     print(f'ID: {s.id}, State: {s.state}, Started: {s.started_at}')
@@ -835,7 +970,7 @@ for s in Scan.objects.using('admin').filter(state='available', started_at__isnul
 
 Before deleting, verify these scans have no associated findings or output:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from api.models import Scan, Finding
 stuck = Scan.objects.using('admin').filter(state='available', started_at__isnull=True)
 for s in stuck:
@@ -846,7 +981,7 @@ for s in stuck:
 
 Only delete scans that show `Findings: 0` and `Started: None`:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from api.models import Scan
 deleted, _ = Scan.objects.using('admin').filter(state='available', started_at__isnull=True).delete()
 print(f'Deleted {deleted} empty scans')
@@ -861,7 +996,7 @@ scan from the UI.
 If a scan is stuck in "queued" and the worker isn't picking it up, purge the Celery queue
 and restart the worker. From the API container:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python -c "
+uv run python -c "
 from config.celery import celery_app
 celery_app.control.purge()
 print('Queue purged')
@@ -870,7 +1005,7 @@ print('Queue purged')
 
 Then get the scan's tenant and provider IDs:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from api.models import Scan
 s = Scan.objects.using('admin').get(id='<SCAN_ID>')
 print(f'Tenant: {s.tenant_id}, Provider: {s.provider_id}')
@@ -879,7 +1014,7 @@ print(f'Tenant: {s.tenant_id}, Provider: {s.provider_id}')
 
 Scale the worker to 0, then back to 1. After it reconnects to Valkey, manually dispatch:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from config.celery import celery_app
 celery_app.send_task('scan-perform', kwargs={'tenant_id': '<TENANT_ID>', 'scan_id': '<SCAN_ID>', 'provider_id': '<PROVIDER_ID>'}, queue='scans')
 print('Task sent')
@@ -889,7 +1024,7 @@ print('Task sent')
 ### Check Celery task results for failures
 To see if scan tasks failed silently:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from django_celery_results.models import TaskResult
 for t in TaskResult.objects.using('admin').filter(task_name='scan-perform').order_by('-date_done')[:5]:
     print(f'Task: {t.task_id}, Status: {t.status}, Date: {t.date_done}')
@@ -917,7 +1052,7 @@ touch /tmp/prowler_api_output/test && rm /tmp/prowler_api_output/test && echo "O
 The UI returns "still being generated" when it finds a Task linked to a `scan-report`
 TaskResult in `STARTED` status. If the worker died mid-generation, the task stays stuck.
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from django_celery_results.models import TaskResult
 stuck = TaskResult.objects.using('admin').filter(status='STARTED')
 for r in stuck:
@@ -927,7 +1062,7 @@ for r in stuck:
 
 If stuck tasks exist, mark them as failed:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from django_celery_results.models import TaskResult
 updated = TaskResult.objects.using('admin').filter(status='STARTED').update(status='FAILURE')
 print(f'Updated {updated} stuck tasks to FAILURE')
@@ -946,7 +1081,7 @@ proceed to Step 4.
 **Step 4: Manually dispatch report generation.**
 Get the scan's tenant and provider IDs:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from api.models import Scan
 s = Scan.objects.using('admin').get(id='<SCAN_ID>')
 print(f'Tenant: {s.tenant_id}, Provider: {s.provider_id}')
@@ -955,7 +1090,7 @@ print(f'Tenant: {s.tenant_id}, Provider: {s.provider_id}')
 
 Restart the worker (scale to 0, back to 1), then dispatch the report task:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from config.celery import celery_app
 celery_app.send_task('scan-report', kwargs={'tenant_id': '<TENANT_ID>', 'scan_id': '<SCAN_ID>', 'provider_id': '<PROVIDER_ID>'}, queue='scan-reports')
 print('Task sent')
@@ -964,7 +1099,7 @@ print('Task sent')
 
 Check task status after a few minutes:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from django_celery_results.models import TaskResult
 for t in TaskResult.objects.using('admin').filter(task_name='scan-report').order_by('-date_done')[:1]:
     print(f'Status: {t.status}, Date: {t.date_done}')
@@ -986,7 +1121,7 @@ find /tmp/prowler_api_output/<TENANT_ID>/<SCAN_ID> -name "*.pdf" 2>/dev/null
 If no PDFs exist, dispatch the compliance reports task (this also regenerates CSVs in
 place — no duplicates):
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from config.celery import celery_app
 celery_app.send_task('scan-compliance-reports', kwargs={'tenant_id': '<TENANT_ID>', 'scan_id': '<SCAN_ID>', 'provider_id': '<PROVIDER_ID>'}, queue='scan-reports')
 print('Task sent')
@@ -997,7 +1132,7 @@ print('Task sent')
 
 ### Lighthouse AI 401 Token errors
 Log out and back in after any API restart. If persistent, verify JWT signing keys are
-static (Step 6) and identical across API, Worker, and Worker-Beat task definitions.
+static (Step 7) and identical across API, Worker, and Worker-Beat task definitions.
 
 ### Lighthouse AI tool errors or hallucinations
 Verify `API_BASE_URL` is set on the MCP server task definition. Without it, `prowler_app_*`
@@ -1022,7 +1157,7 @@ time for the lock to expire.
 ### Reset User Password
 Use the below command to reset user password from ECS Connect in the api container task.
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "from api.models import User; u = User.objects.using('admin').get(email='<user_email_address>'); u.set_password('NewPassword123!'); u.save(using='admin'); print('Done')"
+uv run python manage.py shell -c "from api.models import User; u = User.objects.using('admin').get(email='<user_email_address>'); u.set_password('NewPassword123!'); u.save(using='admin'); print('Done')"
 ```
 
 Run the below command from the database container task to check if the user exists in the database.
@@ -1038,7 +1173,7 @@ directly from the API container.
 
 List all users:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from api.models import User
 for u in User.objects.using('admin').all():
     print(f'{u.email} - {u.id}')
@@ -1047,7 +1182,7 @@ for u in User.objects.using('admin').all():
 
 Before deleting, verify the user isn't the sole member of a tenant:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from api.models import User, Membership
 u = User.objects.using('admin').get(email='<user-email>')
 for m in Membership.objects.using('admin').filter(user=u):
@@ -1058,7 +1193,7 @@ for m in Membership.objects.using('admin').filter(user=u):
 
 If other members exist (Other members > 0), safe to delete:
 ```
-/home/prowler/.cache/pypoetry/virtualenvs/prowler-api-NnJNioq7-py3.12/bin/python manage.py shell -c "
+uv run python manage.py shell -c "
 from api.models import User
 User.objects.using('admin').filter(email='<user-email>').delete()
 print('Done')
@@ -1092,13 +1227,14 @@ task definitions would use `valueFrom` instead of `value`.
 | `DJANGO_CORS_ALLOWED_ORIGINS` | API | Parameter | Parameter Store |
 | `DJANGO_ALLOWED_HOSTS` | API | Parameter | Parameter Store |
 | `DJANGO_ACCESS_TOKEN_LIFETIME` | API, Worker, Beat | Parameter | Parameter Store |
-| `NEXT_PUBLIC_API_BASE_URL` | UI | Parameter | Baked into image at build time — not runtime configurable |
+| `UI_API_BASE_URL` | UI | Parameter | Parameter Store (runtime configurable) |
 | `API_BASE_URL` | MCP | Parameter | Parameter Store |
 | `PROWLER_MCP_SERVER_URL` | UI | Parameter | Parameter Store |
 | `AUTH_URL` | UI | Parameter | Parameter Store |
 
-> Note: `NEXT_PUBLIC_*` variables cannot be managed via Parameter Store because they are
-> inlined at build time. Changing them requires rebuilding the UI image.
+> Note: `NEXT_PUBLIC_PROWLER_RELEASE_VERSION` is the only remaining build-time variable.
+> All other UI configuration including `UI_API_BASE_URL` is now runtime configurable via
+> environment variables or Parameter Store.
 
 ---
 
@@ -1158,6 +1294,19 @@ All findings link back to a scan via ForeignKey(Scan, on_delete=CASCADE), meanin
 Provider is the other key primitive. Deleting a provider cascades to all its scans, which cascades to all findings. The codebase uses soft-delete for providers (is_deleted flag) rather than hard delete, and there's a provider-deletion Celery task that handles cleanup.
 
 
+
+---
+
+## Quick Reference
+
+| Guide | Purpose |
+|-------|---------|
+| [ProwlerScan.md](ProwlerScan.md) | Deploy the ProwlerScan IAM role in target accounts |
+| [prowler-scan-role.yaml](prowler-scan-role.yaml) | CloudFormation template for the ProwlerScan role |
+| [Startup and Shutdown.md](Startup%20and%20Shutdown.md) | Service startup/shutdown order and procedures |
+| [prowler-db.md](prowler-db.md) | Direct database access via ECS Exec |
+| [prowler-api-browser.md](prowler-api-browser.md) | API access from browser, curl, or scripts |
+| [prowler-dashboard.html](prowler-dashboard.html) | Standalone HTML dashboard for offline CSV analysis |
 
 ---
 

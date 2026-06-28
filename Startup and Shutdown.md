@@ -25,3 +25,14 @@ Scale each service to 1 desired task in this order:
 
 ## Notes
 The key patience points are after Postgres (API will crash-loop if Postgres isn't ready) and after API (workers and MCP need the API's database to be migrated). Give each about 2 minutes before moving to the next phase.
+
+## Image Version Considerations on Restart
+
+When services restart (scale 0→1), Fargate pulls the image for the tag in the task definition.
+For Prowler services using the `stable` tag, this means you may pick up a newer release on
+restart. This is generally safe — the API runs migrations automatically on boot. If you need
+deterministic restarts with no version drift, pin to a specific version tag in the task definition.
+
+For data stores (Postgres, Valkey, Neo4j), the images are pinned to exact versions. Never
+change these versions during a routine restart. Version upgrades for data stores should be
+treated as planned maintenance — see the Image Update Policy section in the main README.

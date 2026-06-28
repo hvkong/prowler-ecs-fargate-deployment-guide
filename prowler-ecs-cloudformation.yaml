@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   Prowler ECS Fargate (Demo/POC). Deploys full stack: Postgres, Valkey, Neo4j,
   API, Worker, Worker-Beat, MCP, UI with ALB, EFS, Service Connect.
-  Requires: custom UI ECR image, ACM cert, domain, RSA key pair.
+  Requires: ACM cert, domain, RSA key pair. All container images parameterized.
   All secrets stored in AWS Secrets Manager and injected via ECS Secrets at runtime.
   Not for production — use RDS, ElastiCache, multi-AZ, and hardened SGs in prod.
 
@@ -26,6 +26,9 @@ Metadata:
           - UIImageUri
           - APIImageTag
           - MCPImageTag
+          - PostgresImage
+          - ValkeyImage
+          - Neo4jImage
       - Label:
           default: "Database Credentials"
         Parameters:
@@ -41,6 +44,11 @@ Metadata:
         Parameters:
           - DjangoAccessTokenLifetime
           - EnvironmentPrefix
+      - Label:
+          default: "Scan Target Configuration"
+        Parameters:
+          - ScanTargetAccountId
+          - ScanTargetRoleName
 
     ParameterLabels:
       VpcId:
@@ -54,11 +62,17 @@ Metadata:
       AllowedCIDR:
         default: "Allowed CIDR for ALB access"
       UIImageUri:
-        default: "Custom UI ECR Image URI"
+        default: "Prowler UI Image URI"
       APIImageTag:
         default: "Prowler API Docker Hub tag"
       MCPImageTag:
         default: "Prowler MCP Docker Hub tag"
+      PostgresImage:
+        default: "PostgreSQL container image"
+      ValkeyImage:
+        default: "Valkey container image"
+      Neo4jImage:
+        default: "Neo4j/DozerDB container image"
       PostgresPassword:
         default: "PostgreSQL Password"
       Neo4jPassword:
@@ -72,6 +86,10 @@ Metadata:
         default: "Access Token Lifetime (minutes)"
       EnvironmentPrefix:
         default: "Resource Name Prefix"
+      ScanTargetAccountId:
+        default: "Target AWS Account ID for scanning"
+      ScanTargetRoleName:
+        default: "Target IAM Role name to assume for scanning"
 
 # =============================================================================
 # PARAMETERS
@@ -122,12 +140,11 @@ Parameters:
   # --- Container Images ---
   UIImageUri:
     Type: String
+    Default: 'prowlercloud/prowler-ui:stable'
     Description: >
-      Full ECR URI for the custom Prowler UI image (built with internal API URL baked in).
-      Format: <account-id>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>
-      See deployment guide for build instructions.
-    AllowedPattern: '^[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com\/.+:.+$'
-    ConstraintDescription: Must be a valid ECR image URI with tag.
+      Prowler UI container image. Defaults to the published Docker Hub image.
+      Override with a custom ECR URI if you need to pin a specific build or
+      version string (e.g., 123456789012.dkr.ecr.us-east-1.amazonaws.com/prowler-ui:v5.32.0).
 
   APIImageTag:
     Type: String
@@ -143,38 +160,84 @@ Parameters:
       Docker Hub tag for prowlercloud/prowler-mcp image.
       Use 'stable' for the latest release.
 
+  PostgresImage:
+    Type: String
+    Default: 'postgres:16.3-alpine3.20'
+    Description: >
+      PostgreSQL container image. Pin to a specific version to avoid unexpected
+      upgrades. Major version changes (e.g., 16 to 17) require data migration.
+      Only change this during planned maintenance with a database backup.
+
+  ValkeyImage:
+    Type: String
+    Default: 'valkey/valkey:7-alpine3.19'
+    Description: >
+      Valkey (Redis-compatible) container image. Minor version bumps within
+      the same major version are generally safe. Major version upgrades may
+      change persistence format or protocol behavior.
+
+  Neo4jImage:
+    Type: String
+    Default: 'graphstack/dozerdb:5.26.3.0'
+    Description: >
+      Neo4j/DozerDB container image for Attack Paths graph database.
+      Version changes may require store migration. Test upgrades in a
+      non-production environment first. Back up /data EFS volume before upgrading.
+
   # --- Database Credentials ---
   PostgresPassword:
     Type: String
     NoEcho: true
     MinLength: 8
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9!@#%^&*()\-_=+.]{8,64}$'
+    ConstraintDescription: >
+      8-64 characters. Alphanumeric and !@#%^&*()-_=+. only.
+      Avoid / (breaks Neo4j auth), $ (interpreted by shell/CloudFormation), " and \ (break JSON).
     Description: >
-      Password for the PostgreSQL database.
+      Password for the PostgreSQL database. Use alphanumeric characters and safe
+      special characters (!@#%^&*()-_=+.). Avoid / $ " \ and backticks.
+      Generate with: openssl rand -base64 16
       Will be stored in AWS Secrets Manager by this template.
 
   Neo4jPassword:
     Type: String
     NoEcho: true
     MinLength: 8
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9!@#%^&*()\-_=+.]{8,64}$'
+    ConstraintDescription: >
+      8-64 characters. Alphanumeric and !@#%^&*()-_=+. only.
+      The / character is NOT allowed because Neo4j uses neo4j/<password> format.
     Description: >
       Password for the Neo4j graph database (used for Attack Paths).
+      IMPORTANT: Do not use / in this password — Neo4j auth format is neo4j/<password>
+      and a / in the password breaks the delimiter. Generate with: openssl rand -base64 16
       Will be stored in AWS Secrets Manager by this template.
 
   # --- Application Security Keys ---
   DjangoSecretsEncryptionKey:
     Type: String
     NoEcho: true
+    MinLength: 40
+    MaxLength: 50
     Description: >
-      Encryption key for Django secrets storage.
+      Encryption key for Django secrets storage (encrypts provider credentials in DB).
+      Must be exactly 32 bytes, base64-encoded (44 characters with padding).
       Generate with: openssl rand -base64 32
+      If lost, all stored provider credentials become unreadable.
       Will be stored in AWS Secrets Manager by this template.
 
   AuthSecret:
     Type: String
     NoEcho: true
+    MinLength: 40
+    MaxLength: 50
     Description: >
-      Secret for Auth.js session encryption in the UI.
+      Secret for Auth.js session encryption in the UI (encrypts browser session cookies).
+      Must be exactly 32 bytes, base64-encoded (44 characters with padding).
       Generate with: openssl rand -base64 32
+      Changing this value invalidates all active browser sessions.
       Will be stored in AWS Secrets Manager by this template.
 
 
@@ -198,6 +261,27 @@ Parameters:
     Description: >
       Prefix for all resource names (e.g., prowler, mycompany-prowler).
       Lowercase letters, numbers, and hyphens only. Starts with a letter.
+
+  # --- Scan Target Configuration ---
+  ScanTargetAccountId:
+    Type: String
+    Default: '*'
+    Description: >
+      AWS account ID that Prowler will scan (the account where the ProwlerScan role lives).
+      Use '*' to allow scanning any account, or enter a specific 12-digit account ID to
+      restrict. Can be updated via CloudFormation change set after initial deployment.
+    AllowedPattern: '^(\*|\d{12})$'
+    ConstraintDescription: Must be a 12-digit AWS account ID or '*' for any account.
+
+  ScanTargetRoleName:
+    Type: String
+    Default: 'ProwlerScan'
+    Description: >
+      Name of the IAM role in the target account that Prowler will assume to perform scans.
+      This role must exist in the target account with SecurityAudit + ViewOnlyAccess policies
+      and a trust policy allowing the ECS task role to assume it.
+    AllowedPattern: '^[a-zA-Z0-9+=,.@\-_]{1,64}$'
+    ConstraintDescription: Must be a valid IAM role name (1-64 chars, alphanumeric and +=,.@-_).
 
 # =============================================================================
 # RESOURCES
@@ -447,6 +531,14 @@ Resources:
                   - ssmmessages:OpenControlChannel
                   - ssmmessages:OpenDataChannel
                 Resource: '*'
+        - PolicyName: ProwlerScanAssumeRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::${ScanTargetAccountId}:role/${ScanTargetRoleName}'
 
   # ---------------------------------------------------------------------------
   # Secrets Manager
@@ -657,7 +749,7 @@ Resources:
               IAM: DISABLED
       ContainerDefinitions:
         - Name: postgres
-          Image: 'postgres:16.3-alpine3.20'
+          Image: !Ref PostgresImage
           Essential: true
           PortMappings:
             - ContainerPort: 5432
@@ -699,7 +791,7 @@ Resources:
       TaskRoleArn: !GetAtt TaskRole.Arn
       ContainerDefinitions:
         - Name: valkey
-          Image: 'valkey/valkey:7-alpine3.19'
+          Image: !Ref ValkeyImage
           Essential: true
           PortMappings:
             - ContainerPort: 6379
@@ -738,7 +830,7 @@ Resources:
               IAM: DISABLED
       ContainerDefinitions:
         - Name: neo4j
-          Image: 'graphstack/dozerdb:5.26.3.0'
+          Image: !Ref Neo4jImage
           Essential: true
           PortMappings:
             - ContainerPort: 7687
@@ -1068,13 +1160,12 @@ Resources:
               Name: ui
               AppProtocol: http
           Environment:
-            - { Name: NEXT_PUBLIC_API_BASE_URL, Value: 'http://prowler-api.prowler:8080/api/v1' }
-            - { Name: API_BASE_URL, Value: 'http://prowler-api.prowler:8080/api/v1' }
+            - { Name: UI_API_BASE_URL, Value: 'http://prowler-api.prowler:8080/api/v1' }
             - { Name: AUTH_URL, Value: !Sub 'https://${DomainName}' }
             - { Name: AUTH_TRUST_HOST, Value: 'true' }
-            - { Name: NEXT_PUBLIC_API_DOCS_URL, Value: !Sub 'https://${DomainName}/api/v1/docs' }
+            - { Name: UI_API_DOCS_URL, Value: !Sub 'https://${DomainName}/api/v1/docs' }
             - { Name: PROWLER_MCP_SERVER_URL, Value: 'http://mcp-server.prowler:8000/mcp' }
-            - { Name: NEXT_PUBLIC_PROWLER_RELEASE_VERSION, Value: v5.16.0 }
+            - { Name: NEXT_PUBLIC_PROWLER_RELEASE_VERSION, Value: v5.32.0 }
             - { Name: UI_PORT, Value: '3000' }
           Secrets:
             - Name: AUTH_SECRET

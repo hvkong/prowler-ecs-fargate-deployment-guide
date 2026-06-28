@@ -1,0 +1,287 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  ProwlerScan IAM Role for target AWS accounts. Deploy this template in each
+  account you want Prowler to scan. The role grants read-only security audit
+  permissions and trusts the Prowler ECS task role to assume it.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Required Configuration"
+        Parameters:
+          - ProwlerAccountId
+          - ExternalId
+      - Label:
+          default: "Optional Features"
+        Parameters:
+          - EnableAdditionsPolicy
+          - EnableS3Integration
+          - EnableSecurityHubIntegration
+      - Label:
+          default: "S3 Integration Settings"
+        Parameters:
+          - S3BucketName
+          - S3BucketAccountId
+    ParameterLabels:
+      ProwlerAccountId:
+        default: "Prowler AWS Account ID (where ECS runs)"
+      ExternalId:
+        default: "External ID (from Prowler UI)"
+      EnableAdditionsPolicy:
+        default: "Enable Prowler additions policy (recommended)"
+      EnableS3Integration:
+        default: "Enable S3 integration for scan reports"
+      EnableSecurityHubIntegration:
+        default: "Enable Security Hub integration"
+      S3BucketName:
+        default: "S3 bucket name for scan reports"
+      S3BucketAccountId:
+        default: "S3 bucket owner AWS Account ID"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+
+  ProwlerAccountId:
+    Type: String
+    MinLength: 12
+    MaxLength: 12
+    AllowedPattern: '[0-9]{12}'
+    ConstraintDescription: Must be a valid 12-digit AWS Account ID.
+    Description: >
+      The AWS Account ID where your Prowler ECS deployment runs. This account's
+      task role will be allowed to assume this ProwlerScan role. Find this in
+      your Prowler account's AWS console under Account ID.
+
+  ExternalId:
+    Type: String
+    MinLength: 1
+    AllowedPattern: '.+'
+    ConstraintDescription: External ID must not be empty.
+    Description: >
+      The External ID shown in the Prowler UI when adding an AWS provider.
+      This is your Prowler tenant UUID (auto-generated, not user-configurable).
+      Find it in Prowler UI: Providers > Add Provider > AWS > IAM Role credentials.
+
+  EnableAdditionsPolicy:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Enable the Prowler additions policy. This adds read-only permissions for
+      services not fully covered by SecurityAudit and ViewOnlyAccess (e.g., Bedrock,
+      Backup, AppStream, API Gateway, Security Hub findings import). Recommended
+      for complete scan coverage.
+
+  EnableS3Integration:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Enable S3 write permissions for the Prowler S3 integration feature.
+      When enabled, Prowler can automatically export scan results (CSV, HTML,
+      JSON-OCSF) to an S3 bucket after each scan completes.
+
+  EnableSecurityHubIntegration:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Enable Security Hub permissions for the Prowler Security Hub integration.
+      When enabled, Prowler can send findings to AWS Security Hub in ASFF format.
+      Requires Security Hub to be enabled and the Prowler partner integration
+      to be accepted in the target account.
+
+  S3BucketName:
+    Type: String
+    Default: ''
+    Description: >
+      The S3 bucket name where Prowler will store scan reports. Required if
+      EnableS3Integration is true. The bucket can be in this account or a
+      different account (cross-account requires a bucket policy).
+
+  S3BucketAccountId:
+    Type: String
+    Default: ''
+    Description: >
+      The AWS Account ID that owns the S3 bucket. Required if EnableS3Integration
+      is true. Used as a condition to restrict S3 writes to only this account's buckets.
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  AdditionsPolicyEnabled: !Equals [!Ref EnableAdditionsPolicy, 'true']
+  S3IntegrationEnabled: !Equals [!Ref EnableS3Integration, 'true']
+  SecurityHubEnabled: !Equals [!Ref EnableSecurityHubIntegration, 'true']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  ProwlerScanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ProwlerScan
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${ProwlerAccountId}:root'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref ExternalId
+      MaxSessionDuration: 3600
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/SecurityAudit'
+        - 'arn:aws:iam::aws:policy/job-function/ViewOnlyAccess'
+      Policies:
+        - !If
+          - AdditionsPolicyEnabled
+          - PolicyName: ProwlerAdditions
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: AllowMoreReadOnly
+                  Effect: Allow
+                  Action:
+                    - 'account:Get*'
+                    - 'appstream:Describe*'
+                    - 'appstream:List*'
+                    - 'backup:List*'
+                    - 'backup:Get*'
+                    - 'bedrock:List*'
+                    - 'bedrock:Get*'
+                    - 'cloudtrail:GetInsightSelectors'
+                    - 'codeartifact:List*'
+                    - 'codebuild:BatchGet*'
+                    - 'codebuild:ListReportGroups'
+                    - 'cognito-idp:GetUserPoolMfaConfig'
+                    - 'dlm:Get*'
+                    - 'drs:Describe*'
+                    - 'ds:Get*'
+                    - 'ds:Describe*'
+                    - 'ds:List*'
+                    - 'dynamodb:GetResourcePolicy'
+                    - 'ec2:GetEbsEncryptionByDefault'
+                    - 'ec2:GetSnapshotBlockPublicAccessState'
+                    - 'ec2:GetInstanceMetadataDefaults'
+                    - 'ecr:Describe*'
+                    - 'ecr:GetRegistryScanningConfiguration'
+                    - 'elasticfilesystem:DescribeBackupPolicy'
+                    - 'glue:GetConnections'
+                    - 'glue:GetSecurityConfiguration*'
+                    - 'glue:SearchTables'
+                    - 'glue:GetMLTransforms'
+                    - 'lambda:GetFunction*'
+                    - 'logs:FilterLogEvents'
+                    - 'lightsail:GetRelationalDatabases'
+                    - 'macie2:GetMacieSession'
+                    - 'macie2:GetAutomatedDiscoveryConfiguration'
+                    - 'rolesanywhere:ListTagsForResource'
+                    - 'rolesanywhere:ListTrustAnchors'
+                    - 's3:GetAccountPublicAccessBlock'
+                    - 'shield:DescribeProtection'
+                    - 'shield:GetSubscriptionState'
+                    - 'securityhub:BatchImportFindings'
+                    - 'securityhub:GetFindings'
+                    - 'servicecatalog:Describe*'
+                    - 'servicecatalog:List*'
+                    - 'ssm:GetDocument'
+                    - 'ssm-incidents:List*'
+                    - 'states:ListTagsForResource'
+                    - 'support:Describe*'
+                    - 'tag:GetTagKeys'
+                    - 'wellarchitected:List*'
+                  Resource: '*'
+                - Sid: AllowAPIGatewayReadOnly
+                  Effect: Allow
+                  Action:
+                    - 'apigateway:GET'
+                  Resource:
+                    - 'arn:*:apigateway:*::/restapis/*'
+                    - 'arn:*:apigateway:*::/apis/*'
+                    - 'arn:*:apigateway:*::/domainnames'
+                    - 'arn:*:apigateway:*::/domainnames/*'
+          - !Ref AWS::NoValue
+        - !If
+          - S3IntegrationEnabled
+          - PolicyName: ProwlerS3Integration
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: AllowS3PutObject
+                  Effect: Allow
+                  Action:
+                    - 's3:PutObject'
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}/*'
+                  Condition:
+                    StringEquals:
+                      's3:ResourceAccount': !Ref S3BucketAccountId
+                - Sid: AllowS3ListBucket
+                  Effect: Allow
+                  Action:
+                    - 's3:ListBucket'
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}'
+                  Condition:
+                    StringEquals:
+                      's3:ResourceAccount': !Ref S3BucketAccountId
+                - Sid: AllowS3DeleteConnectionTest
+                  Effect: Allow
+                  Action:
+                    - 's3:DeleteObject'
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}/*test-prowler-connection.txt'
+                  Condition:
+                    StringEquals:
+                      's3:ResourceAccount': !Ref S3BucketAccountId
+          - !Ref AWS::NoValue
+        - !If
+          - SecurityHubEnabled
+          - PolicyName: ProwlerSecurityHub
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: AllowSecurityHubImport
+                  Effect: Allow
+                  Action:
+                    - 'securityhub:BatchImportFindings'
+                    - 'securityhub:BatchUpdateFindings'
+                    - 'securityhub:GetFindings'
+                  Resource: '*'
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Service
+          Value: Prowler
+        - Key: Purpose
+          Value: Security scanning via Prowler ECS deployment
+        - Key: CloudFormation
+          Value: 'true'
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+
+  ProwlerScanRoleArn:
+    Description: >
+      ARN of the ProwlerScan role. Enter this in the Prowler UI when adding
+      the AWS provider (Providers > Add Provider > Role ARN field).
+    Value: !GetAtt ProwlerScanRole.Arn
+
+  TrustConfiguration:
+    Description: Summary of the trust relationship configured on this role.
+    Value: !Sub >
+      Trusted account: ${ProwlerAccountId},
+      External ID: ${ExternalId},
+      Role ARN: ${ProwlerScanRole.Arn}
